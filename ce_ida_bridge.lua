@@ -1,0 +1,282 @@
+-- CE 7.x / Windows. Run inside CE's Lua Engine, or open the supplied CT.
+-- Reads the selected process; it does not attach a debugger or write memory.
+if CE_IDA_BRIDGE and CE_IDA_BRIDGE.form then
+  CE_IDA_BRIDGE.form.show()
+  CE_IDA_BRIDGE.form.bringToFront()
+  return
+end
+
+local state = {busy=false, watching=true, pid=getOpenedProcessID(), candidates={}}
+CE_IDA_BRIDGE = state
+local temp = os.getenv('TEMP') or getTempFolder()
+local samplePath = temp:gsub('[\\/]+$', '') .. '\\CE_IDA_Bridge\\anchor.txt'
+local MAX_ADDRESS = 140737488355327 -- 0x7FFFFFFFFFFF, exact also with Lua doubles.
+
+local function hex(number)
+  local n, out = math.abs(number), ''
+  repeat
+    local digit = n % 16
+    out = ('0123456789ABCDEF'):sub(digit+1, digit+1) .. out
+    n = math.floor(n / 16)
+  until n == 0
+  return (number < 0 and '-' or '') .. '0x' .. string.rep('0', math.max(0, 12-#out)) .. out
+end
+
+local function address(text)
+  local value = tostring(text or ''):gsub('[%s_`]', ''):gsub('^0[xX]', ''):gsub('[hH]$', '')
+  if value == '' or not value:match('^[%x]+$') then return nil end
+  local n = 0
+  for digit in value:gmatch('.') do
+    n = n * 16 + tonumber(digit, 16)
+    if n > MAX_ADDRESS then return nil end
+  end
+  return n
+end
+
+local function loadSample()
+  local file = io.open(samplePath, 'rb')
+  if not file then return nil, '尚未收到 IDA 样本。请命中一个代码断点。' end
+  local text = file:read(8192)
+  file:close()
+  if not text then return nil, '样本文件为空。' end
+  local lines = {}
+  for line in text:gmatch('[^\r\n]+') do lines[#lines+1] = line end
+  if #lines ~= 6 or lines[1] ~= 'CEIDA1' or not lines[2]:match('^%x+$') then
+    return nil, '样本格式无效，请在 IDA 重新导出。'
+  end
+  local timestamp, pc, guest = tonumber(lines[3]), address(lines[4]), address(lines[5])
+  if not timestamp or not pc or not guest then return nil, '样本地址或时间无效。' end
+  local bytes, normalized = {}, {}
+  for token in lines[6]:gmatch('%S+') do
+    if not token:match('^%x%x$') then return nil, '样本 AOB 格式无效。' end
+    bytes[#bytes+1] = tonumber(token, 16)
+    normalized[#normalized+1] = token:upper()
+  end
+  if #bytes < 16 or #bytes > 64 then return nil, '样本长度应为 16～64 字节。' end
+  return {token=lines[2], timestamp=timestamp, pc=pc, guest=guest, bytes=bytes, aob=table.concat(normalized, ' ')}
+end
+
+local form = createForm(false)
+state.form = form
+form.Caption = 'CE ↔ IDA 自动校准 | Eden / Ryujinx'
+form.Width = 860
+form.Height = 680
+form.Position = 'poScreenCenter'
+form.Font.Size = 10
+
+local function label(text, x, y)
+  local control = createLabel(form)
+  control.Caption, control.Left, control.Top = text, x, y
+  return control
+end
+local function button(text, x, y, width)
+  local control = createButton(form)
+  control.Caption, control.Left, control.Top, control.Width, control.Height = text, x, y, width, 32
+  return control
+end
+local function edit(x, y, width, readonly)
+  local control = createEdit(form)
+  control.Left, control.Top, control.Width, control.Height = x, y, width, 28
+  control.ReadOnly = readonly or false
+  control.Font.Name = 'Consolas'
+  control.Font.Size = 11
+  return control
+end
+
+label('1. IDA 加载配套 Python 脚本；CE 选择对应的 Eden / Ryujinx 进程。', 16, 14)
+label('2. IDA 命中 ARM64 代码断点后，CE 自动 AOB 搜索并计算差值。', 16, 39)
+local watchButton = button('暂停自动接收', 16, 73, 150)
+local scanButton = button('搜索最近样本', 180, 73, 150)
+local status = label('等待 IDA 断点样本……', 16, 120)
+status.AutoSize = false
+status.Width, status.Height = 810, 42
+status.WordWrap = true
+
+label('IDA / GDB 取样起点（断点后 +4 字节）', 16, 166)
+local guestEdit = edit(16, 190, 380, true)
+label('选择 CE 命中地址 / 映射差值', 16, 229)
+local choice = createComboBox(form)
+choice.Left, choice.Top, choice.Width, choice.Height = 16, 253, 810, 30
+choice.Style = 'csDropDownList'
+choice.Font.Name = 'Consolas'
+label('差值 Δ = CE 参考地址 − 游戏参考地址', 16, 291)
+local deltaEdit = edit(16, 315, 570, true)
+local copyDelta = button('复制差值', 600, 314, 130)
+copyDelta.Enabled = false
+label('CE 金钱 / 血量地址（十六进制）', 16, 357)
+local targetEdit = edit(16, 381, 380)
+local convertButton = button('换算游戏地址', 410, 379, 155)
+local targetResult = edit(16, 423, 570, true)
+local copyResult = button('复制游戏地址', 600, 421, 150)
+copyResult.Enabled = false
+label('游戏地址 = CE 目标地址 − Δ。多个镜像不会自动任选其一；重启游戏后需重新校准。', 16, 465)
+local log = createMemo(form)
+log.Left, log.Top, log.Width, log.Height = 16, 493, 810, 130
+log.ReadOnly, log.ScrollBars, log.WordWrap = true, 'ssVertical', false
+log.Font.Name = 'Consolas'
+log.Font.Size = 9
+
+local function message(text)
+  status.Caption = text
+  log.Lines.add(os.date('%H:%M:%S') .. '  ' .. text)
+end
+
+local function clearCalibration()
+  state.candidates, state.sample, state.selected = {}, nil, nil
+  choice.Items.clear()
+  choice.ItemIndex = -1
+  guestEdit.Text, deltaEdit.Text, targetResult.Text = '', '', ''
+  copyDelta.Enabled, copyResult.Enabled = false, false
+end
+
+local function sameBytes(host, bytes)
+  local ok, current = pcall(readBytes, host, #bytes, true)
+  if not ok or type(current) ~= 'table' or #current ~= #bytes then return false end
+  for i=1,#bytes do if bytes[i] ~= current[i] then return false end end
+  return true
+end
+
+local function convert()
+  targetResult.Text = ''
+  copyResult.Enabled = false
+  if getOpenedProcessID() ~= state.pid then
+    clearCalibration()
+    message('CE 进程已改变，请重新命中 IDA 断点校准。')
+    return
+  end
+  local selected = state.selected
+  if not selected then message('请先完成校准，并选择一个 CE 命中地址。'); return end
+  if not sameBytes(selected.host, state.sample.bytes) then
+    clearCalibration()
+    message('参考内存已变化或不可读，请重新命中 IDA 断点校准。')
+    return
+  end
+  local host = address(targetEdit.Text)
+  if not host then message('请输入 CE 目标地址（十六进制，Windows 用户态地址）。'); return end
+  local guest = host - selected.delta
+  if guest < 0 or guest > MAX_ADDRESS then
+    message('换算结果超出范围，请改选对应的映射候选。')
+    return
+  end
+  targetResult.Text = hex(guest)
+  copyResult.Enabled = true
+  message('候选游戏地址：' .. hex(guest) .. '。可在 IDA 内存窗口核对目标数值。')
+end
+
+choice.OnChange = function()
+  state.selected = state.candidates[choice.ItemIndex + 1]
+  targetResult.Text = ''
+  copyResult.Enabled = false
+  copyDelta.Enabled = state.selected ~= nil
+  deltaEdit.Text = state.selected and hex(state.selected.delta) or ''
+end
+targetEdit.OnChange = function() targetResult.Text = ''; copyResult.Enabled = false end
+convertButton.OnClick = convert
+copyDelta.OnClick = function() if state.selected then writeToClipboard(hex(state.selected.delta)) end end
+copyResult.OnClick = function() if targetResult.Text ~= '' then writeToClipboard(targetResult.Text) end end
+
+local function beginScan(sample)
+  if state.busy then return end
+  if getOpenedProcessID() == 0 then message('请先在 CE 中选择 Eden / Ryujinx 进程。'); return end
+  local age = os.time() - sample.timestamp
+  if age > 1800 or age < -60 then message('样本已过期，请让 IDA 重新命中断点或执行 ce_ida_export_now()。'); return end
+  clearCalibration()
+  state.pid = getOpenedProcessID()
+  local scanPid = state.pid
+  state.busy = true
+  scanButton.Enabled = false
+  guestEdit.Text = hex(sample.guest)
+  message('正在 AOB 搜索 ' .. #sample.bytes .. ' 字节，请保持 IDA 暂停，且不要切换 CE 进程……')
+  log.Lines.add('PC=' .. hex(sample.pc) .. '  Anchor=' .. hex(sample.guest))
+  log.Lines.add(sample.aob)
+  createThread(function()
+    local results
+    local ok, payload = pcall(function()
+      -- Guest ARM64 code can be non-executable in the Windows mapping.
+      results = AOBScan(sample.aob, '*X*C*W', 0, '1')
+      local rows = {}
+      if results then
+        if results.Count > 256 then error('命中超过 256 个位置，请换一个字节更独特的代码断点。') end
+        for i=0,results.Count-1 do
+          local host = address(results[i])
+          if host and sameBytes(host, sample.bytes) then
+            rows[#rows+1] = {host=host, delta=host-sample.guest}
+          end
+        end
+      end
+      return rows
+    end)
+    if results then results.destroy() end
+    synchronize(function()
+      state.busy = false
+      scanButton.Enabled = true
+      if getOpenedProcessID() ~= scanPid then
+        clearCalibration()
+        message('扫描期间 CE 进程已切换，结果已丢弃；请重新校准。')
+        return
+      end
+      if not ok then message('扫描失败：' .. tostring(payload)); return end
+      state.sample, state.candidates = sample, payload
+      for index, row in ipairs(payload) do
+        choice.Items.add(tostring(index) .. '  CE=' .. hex(row.host) .. '    delta=' .. hex(row.delta))
+        log.Lines.add('CE=' .. hex(row.host) .. '  delta=' .. hex(row.delta))
+      end
+      if #payload == 0 then
+        message('未找到匹配。确认 CE 进程一致且包含 MEM_MAPPED 扫描，再换一个断点重试。')
+      elseif #payload == 1 then
+        choice.ItemIndex = 0
+        choice.OnChange()
+        message('已找到 1 个匹配并计算差值。填写 CE 目标地址即可换算。')
+      else
+        choice.ItemIndex = -1
+        message('找到 ' .. #payload .. ' 个匹配（可能含镜像或副本）。请在下拉框选择，差值已全部列出。')
+      end
+    end)
+  end)
+end
+
+local existing = loadSample()
+state.lastToken = existing and existing.token or ''
+scanButton.OnClick = function()
+  local sample, errorMessage = loadSample()
+  if not sample then message(errorMessage); return end
+  state.lastToken = sample.token
+  beginScan(sample)
+end
+watchButton.OnClick = function()
+  state.watching = not state.watching
+  watchButton.Caption = state.watching and '暂停自动接收' or '启用自动接收'
+  message(state.watching and '等待 IDA 新断点样本……' or '自动接收已暂停；正在进行的扫描会完成。')
+end
+local timer = createTimer(form, false)
+timer.Interval = 500
+timer.OnTimer = function()
+  if state.busy then return end
+  if state.pid ~= getOpenedProcessID() then
+    state.pid = getOpenedProcessID()
+    clearCalibration()
+    local latest = loadSample()
+    state.lastToken = latest and latest.token or ''
+    message('CE 进程已改变，旧校准已清除；请在 IDA 命中一个新断点。')
+  end
+  if not state.watching or getOpenedProcessID() == 0 then return end
+  local sample = loadSample()
+  if sample and sample.token ~= state.lastToken then
+    state.lastToken = sample.token
+    beginScan(sample)
+  end
+end
+timer.Enabled = true
+form.OnClose = function()
+  if state.busy then
+    message('扫描尚未结束。可先最小化窗口，完成后再关闭。')
+    return caNone
+  end
+  timer.Enabled = false
+  CE_IDA_BRIDGE = nil
+  return caFree
+end
+log.Lines.add('样本文件：' .. samplePath)
+log.Lines.add('只计算映射候选；同一差值必须适用于你的 CE 目标地址。')
+if state.pid == 0 then message('请先在 CE 中选择 Eden / Ryujinx 进程，再在 IDA 命中断点。') end
+form.show()
